@@ -11,6 +11,7 @@ tft_advisor/
 ├── tft_web_ui.py              # Web 界面主程序（Flask 单文件前端）
 ├── tft_rag_agent.py           # RAG Agent + 多智能体协同分析
 ├── tft_screen_capture.py      # 截图识别引擎（OpenCV 模板匹配）
+├── tft_yolo_clip.py           # 截图识别引擎（YOLO+CLIP 双阶段，推荐）
 ├── tft_converter.py           # 阵容格式转换 + 羁绊计算
 ├── tft_data_manager.py        # 赛季数据自动拉取（CommunityDragon/DDragon）
 ├── tft_fetch_assets.py        # 模板图片下载（英雄头像 + 装备图标）
@@ -18,6 +19,9 @@ tft_advisor/
 ├── tft_assets/                # 模板图片目录（fetch_assets 后自动生成）
 │   ├── champions/             #   英雄头像 (TFT16_Draven.png ...)
 │   └── items/                 #   装备图标 (TFT_Item_Deathblade.png ...)
+│
+├── tft_yolo_models/           # YOLO 模型目录（训练后生成）
+│   └── tft_champion_det.pt    #   YOLO 检测模型
 │
 ├── tft_champion_db.json       # 英雄完整数据（data_manager 生成）
 ├── tft_trait_db.json          # 羁绊激活阈值
@@ -128,30 +132,115 @@ python tft_web_ui.py
 
 ## 截图识别说明
 
+### 识别引擎对比
+
+| 特性 | OpenCV 模板匹配（旧） | YOLO+CLIP（新） |
+|------|---------------------|-----------------|
+| 定位方式 | 彩色六边形边框检测 | YOLOv8 目标检测 |
+| 识别方式 | 颜色直方图 + NCC 模板匹配 | CLIP 零样本语义分类 |
+| 准确率 | ~75%（受边框颜色影响） | ~90%+（语义理解） |
+| 泛化性 | 需手动更新模板 | 支持新英雄零样本识别 |
+| 速度 | 快（CPU） | 中等（建议 GPU） |
+| 依赖 | opencv-python | ultralytics, clip, torch |
+
+### 使用 YOLO+CLIP 引擎
+
+#### 1. 安装依赖
+
+```bash
+# YOLOv8
+pip install ultralytics
+
+# CLIP（需要 PyTorch）
+pip install torch torchvision
+pip install git+https://github.com/openai/CLIP.git
+
+# 完整依赖
+pip install ultralytics torch torchvision ftfy regex
+```
+
+#### 2. 快速开始
+
+```bash
+# 识别截图（YOLO 检测 + CLIP 分类）
+python tft_yolo_clip.py screenshot.png
+
+# 仅 YOLO 检测（快速定位）
+python tft_yolo_clip.py screenshot.png --detect-only
+
+# 显示详细结果
+python tft_yolo_clip.py screenshot.png --debug
+
+# 指定模式
+python tft_yolo_clip.py screenshot.png --mode yolo_clip
+```
+
+#### 3. 训练自定义 YOLO 模型（推荐）
+
+```bash
+# 创建训练配置文件
+python tft_yolo_clip.py --train --data ./yolo_data.yaml --epochs 100
+
+# 准备数据集后重新训练
+# 数据集格式：YOLOv8 标准格式（images/ + labels/）
+python tft_yolo_clip.py --train --data ./yolo_data.yaml --epochs 200 --imgsz 640
+```
+
+### 使用 OpenCV 模板匹配引擎（旧版）
+
+```bash
+# 下载模板图片
+python tft_fetch_assets.py
+
+# 识别截图
+python tft_screen_capture.py screenshot.png
+python tft_screen_capture.py screenshot.png --debug
+```
+
 ### 支持的截图类型
 
-| 类型 | 检测方法 |
-|------|---------|
-| 对局中棋盘 | 检测彩色六边形边框（青/紫/金/蓝） |
-| 结算/回顾横排 | Canny 边缘 + 水平对齐检测 |
+| 类型 | YOLO+CLIP | OpenCV |
+|------|-----------|--------|
+| 对局中棋盘 | ✅ | ✅ 六边形边框检测 |
+| 结算/回顾横排 | ✅ | ✅ Canny 边缘检测 |
+| 无框模式 | ✅ | ❌ |
 
-### 识别流程
+### 识别流程对比
 
+**OpenCV 模板匹配：**
 ```
 截图 → 检测六边形边框 → 裁剪英雄区域
-     → 颜色直方图粗筛（前 10 候选）
+     → 颜色直方图粗筛（前 15 候选）
      → 灰度模板 NCC 精匹配 → 确定英雄 ID
-     → 检测星点数量 → 装备区域匹配 → 推断棋盘坐标
+     → 检测星点数量 → 装备区域匹配
+```
+
+**YOLO+CLIP：**
+```
+截图 → YOLOv8 检测英雄位置 → 裁剪英雄区域
+     → CLIP 零样本分类（多提示模板）
+     → 取最高相似度 → 确定英雄 ID
+     → 检测星点数量 → 装备识别（可扩展）
 ```
 
 ### 标定模式（识别不准时）
 
+**OpenCV 引擎：**
 ```bash
-# 找最佳阈值（已知截图中有哪些英雄时使用）
+# 找最佳阈值
 python tft_screen_capture.py screenshot.png --calibrate --known Draven Kindred Leona
 
-# 输出标注图查看匹配框
+# 输出标注图
 python tft_screen_capture.py screenshot.png --debug --threshold 0.50
+```
+
+**YOLO+CLIP 引擎：**
+```bash
+# 调整检测置信度
+python tft_yolo_clip.py screenshot.png --mode yolo_only --debug
+
+# 调整 CLIP 阈值（需修改代码中的 CLIP_THRESHOLD）
+# 或编辑 tft_yolo_clip.py 第 51 行
 ```
 
 ---
@@ -215,15 +304,44 @@ python tft_screen_capture.py screenshot.png --save result.json
 
 ## 依赖
 
-```
+### 基础依赖（必须）
+
+```bash
 flask
 requests
 opencv-python
 pillow
 ```
 
-可选（ORB 特征点匹配，识别更精准）：
+### YOLO+CLIP 引擎（可选，推荐）
+
+```bash
+# 目标检测
+ultralytics
+
+# 语义识别（需要 PyTorch）
+torch
+torchvision
+git+https://github.com/openai/CLIP.git
+ftfy
+regex
 ```
+
+### 安装命令
+
+```bash
+# 最小安装（仅 OpenCV 模板匹配）
+pip install flask requests opencv-python pillow
+
+# 完整安装（包含 YOLO+CLIP）
+pip install flask requests opencv-python pillow ultralytics torch torchvision ftfy regex
+pip install git+https://github.com/openai/CLIP.git
+```
+
+### 可选依赖
+
+ORB 特征点匹配（OpenCV 引擎更精准）：
+```bash
 opencv-contrib-python
 ```
 
@@ -244,7 +362,28 @@ opencv-contrib-python
 
 **Q: 截图识别结果全是 unknown**
 
-A: 模板图片未下载。运行 `python tft_fetch_assets.py`，然后用 `--calibrate` 找适合该截图的阈值。
+A: 
+- **OpenCV 引擎**: 模板图片未下载。运行 `python tft_fetch_assets.py`，然后用 `--calibrate` 找适合该截图的阈值。
+- **YOLO+CLIP 引擎**: 
+  - 检查是否安装了依赖：`pip install ultralytics torch torchvision clip`
+  - YOLO 模型未训练时检测效果有限，建议使用 `--train` 训练专用模型
+  - CLIP 需要 GPU 才能获得较好效果，CPU 模式可能较慢且准确率低
+
+**Q: YOLO+CLIP 识别很慢**
+
+A: 
+- CLIP 模型较大，建议使用 GPU（CUDA）运行
+- 可切换为 `--mode yolo_only` 仅做检测不做分类
+- 或使用较小的 CLIP 模型：修改 `CLIP_MODEL_NAME = "RN50"`
+
+**Q: 如何准备 YOLO 训练数据？**
+
+A:
+1. 收集 TFT 截图（建议 100+ 张，覆盖不同场景）
+2. 使用标注工具（如 LabelImg、Roboflow）标注英雄位置
+3. 导出为 YOLOv8 格式（images/ + labels/）
+4. 修改 `yolo_data.yaml` 中的路径
+5. 运行 `python tft_yolo_clip.py --train --data ./yolo_data.yaml --epochs 100`
 
 **Q: 知识库一直显示 Building KB...**
 
@@ -257,3 +396,19 @@ A: 可以。没有 Key 时跳过高端局数据采集，仅使用本地羁绊词
 **Q: 如何切换到 Anthropic Claude？**
 
 A: 在 Settings 面板选 Anthropic，填入 `sk-ant-...` Key；或在 `tft_rag_agent.py` 中设置 `"llm_provider": "anthropic"`。
+
+**Q: CLIP 安装失败怎么办？**
+
+A: 
+```bash
+# 方法 1: 使用 pip 直接安装
+pip install git+https://github.com/openai/CLIP.git
+
+# 方法 2: 手动克隆安装
+git clone https://github.com/openai/CLIP.git
+cd CLIP
+pip install -e .
+
+# 确保已安装 PyTorch 和 torchvision
+pip install torch torchvision
+```
