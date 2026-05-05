@@ -170,7 +170,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 
 /* Hex board */
 .hex-board{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;flex-shrink:0}
-.hex-cell{aspect-ratio:1;border:1px dashed var(--brd);border-radius:5px;
+.hex-cell{aspect-ratio:4/7;border:1px dashed var(--brd);border-radius:5px;
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   cursor:pointer;transition:.15s;background:var(--sur);overflow:hidden;
   position:relative;min-height:0;font-size:8px;color:var(--dim)}
@@ -358,7 +358,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
         <div class="champ-dropdown" id="champDD"></div>
       </div>
       <div class="lbl" style="margin-top:4px">
-        已选 <span id="rosterCnt" style="color:var(--teal)">0</span>/9
+        已选 <span id="rosterCnt" style="color:var(--teal)">0</span>/14
         <span style="color:var(--dim);font-size:9px;margin-left:6px">点击英雄图标选装备</span>
       </div>
       <div class="roster-list" id="rosterList"></div>
@@ -564,7 +564,7 @@ function showDD(){
 function hideDD(){ setTimeout(()=>document.getElementById('champDD').classList.remove('show'),150); }
 
 function addChamp(apiName){
-  if(roster.length>=9){toast('最多9名英雄');return;}
+  if(roster.length>=14){toast('最多14名英雄');return;}
   if(roster.find(c=>c.api_name===apiName)){toast('已添加');return;}
   const c=champDB.find(x=>x.api_name===apiName);if(!c)return;
   const pos=nextPos();
