@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 tft_web_ui.py — TFT 阵容顾问 Web 界面 v3
@@ -11,8 +11,9 @@ tft_web_ui.py — TFT 阵容顾问 Web 界面 v3
   - /api/input/builder   棋盘提交接口
 """
 
-import json, os, sys, threading, traceback, mimetypes
+import json, os, re, sys, threading, traceback, mimetypes
 from pathlib import Path
+from difflib import SequenceMatcher
 
 from flask import Flask, request, jsonify, send_file, abort
 sys.path.insert(0, str(Path(__file__).parent))
@@ -56,15 +57,117 @@ threading.Thread(target=_build_kb_bg, daemon=True).start()
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────
+def _repair_json_text(text: str) -> str:
+    fixed_lines = []
+    for line in text.splitlines():
+        if line.count('"') % 2 == 1:
+            if re.match(r'^\s*"[^"]+:\s*\{\s*$', line):
+                line = re.sub(r'^(\s*"[^"]+):', r'\1":', line)
+            elif re.match(r'^\s*"[^"]+"\s*:\s*"[^"]*,\s*$', line):
+                line = re.sub(r',\s*$', '",', line)
+            elif re.match(r'^\s*"[^"]+"\s*:\s*"[^"]*\s*$', line):
+                line = line + '"'
+        fixed_lines.append(line)
+    return "\n".join(fixed_lines)
+
+
 def _load_db(cfg_key: str, *fallbacks) -> dict:
     paths = [rag.CFG.get(cfg_key, ""), *fallbacks]
     for p in paths:
         if p and Path(p).exists():
-            try:
-                return json.loads(Path(p).read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            text = Path(p).read_text(encoding="utf-8", errors="replace")
+            for candidate in (text, _repair_json_text(text)):
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    pass
     return {}
+
+
+def _text_quality_score(text: str) -> float:
+    text = text or ""
+    cjk = sum(2 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    latin = sum(0.2 for ch in text if ch.isascii() and ch.isalpha())
+    bad = (text.count("?") + text.count("�") + text.count("\ufffd")) * 3
+    return cjk + latin - bad + len(text) * 0.01
+
+
+def _fix_mojibake_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    candidates = [text]
+    for enc in ("gbk", "gb18030"):
+        try:
+            repaired = text.encode(enc, errors="ignore").decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if repaired:
+            candidates.append(repaired)
+    seen = []
+    for item in candidates:
+        if item and item not in seen:
+            seen.append(item)
+    return max(seen, key=_text_quality_score)
+
+
+def _clean_match_text(text: str) -> str:
+    text = _fix_mojibake_text(text)
+    return re.sub(r'[?�\ufffd]+$', '', text).strip()
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
+
+
+def _champion_names(info: dict, api_name: str, set_n: int) -> tuple[str, str, str]:
+    short_id = (info.get("short_id") or api_name.replace(f"TFT{set_n}_", "").replace("TFT_", "") or api_name).strip()
+    raw_cn = info.get("name_cn") or info.get("name_zh") or ""
+    raw_name = info.get("name_en") or ""
+    name_cn = _clean_match_text(raw_cn or raw_name)
+    if not _has_cjk(name_cn):
+        name_cn = ""
+    name_en = short_id or _fix_mojibake_text(raw_name) or api_name
+    return short_id, name_en.strip(), name_cn
+
+
+def _item_names(info: dict, api_name: str) -> tuple[str, str]:
+    raw_cn = info.get("name_cn") or info.get("name_zh") or ""
+    raw_name = info.get("name_en") or api_name
+    name_cn = _clean_match_text(raw_cn or raw_name)
+    if not _has_cjk(name_cn):
+        name_cn = ""
+    name_en = (_fix_mojibake_text(raw_name) or api_name).strip()
+    if name_cn and name_en == name_cn:
+        name_en = api_name
+    return name_en, name_cn
+
+def _effective_set_number(default: int = 16) -> int:
+    meta_path = Path("tft_meta.json")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            set_number = int(meta.get("set_number", 0) or 0)
+            if set_number > 0:
+                return set_number
+        except Exception:
+            pass
+
+    db = _load_db("champion_db_file", "tft_champion_db.json", "./tft_rag_data/tft_champion_db.json")
+    counts = {}
+    for api_name in db.keys():
+        if not api_name.startswith("TFT") or "_" not in api_name:
+            continue
+        prefix = api_name.split("_", 1)[0]
+        try:
+            set_number = int(prefix[3:])
+        except ValueError:
+            continue
+        counts[set_number] = counts.get(set_number, 0) + 1
+    if counts:
+        return max(counts.items(), key=lambda item: item[1])[0]
+
+    return int(rag.CFG.get("current_set", default) or default)
 
 
 def _champ_img(api_name: str) -> str:
@@ -75,6 +178,96 @@ def _item_img(api_name: str) -> str:
     return f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VER}/img/tft-item/{api_name}.png"
 
 
+def _normalize_lookup_text(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"[\s\-_'/·.]+", "", text)
+    text = re.sub(r"[()（）\[\]{}]", "", text)
+    return text
+
+
+def _current_set_only(api_name: str, set_n: int) -> bool:
+    if not api_name.startswith("TFT"):
+        return False
+    if '_' not in api_name:
+        return True
+    prefix = api_name.split('_', 1)[0]
+    try:
+        db_set = int(prefix[3:])
+    except ValueError:
+        return True
+    return db_set == set_n or db_set == 16
+
+
+def _champion_lookup_rows() -> list:
+    db = _load_db("champion_db_file", "tft_champion_db.json", "./tft_rag_data/tft_champion_db.json")
+    set_n = _effective_set_number()
+    rows = []
+    for api_name, info in db.items():
+        if not _current_set_only(api_name, set_n):
+            continue
+        short_id, name_en, name_cn = _champion_names(info, api_name, set_n)
+        aliases = {
+            api_name,
+            short_id,
+            name_en,
+            name_cn,
+            info.get("name_en", ""),
+            info.get("name_cn", ""),
+            info.get("name_zh", ""),
+        }
+        aliases.update(info.get("traits", [])[:4])
+        norm_aliases = sorted({_normalize_lookup_text(_fix_mojibake_text(alias)) for alias in aliases if alias})
+        try:
+            cost = int(info.get("cost", 1) or 1)
+        except Exception:
+            cost = 1
+        rows.append({
+            "api_name": api_name,
+            "short_id": short_id,
+            "name_en": name_en,
+            "name_cn": name_cn,
+            "cost": cost,
+            "aliases": norm_aliases,
+        })
+    return rows
+
+def _score_champion_alias(query: str, alias: str) -> float:
+    if not query or not alias:
+        return 0.0
+    if query == alias:
+        return 1.0
+    if query in alias or alias in query:
+        return 0.92 + min(len(query), len(alias)) / max(len(query), len(alias), 1) * 0.06
+    return SequenceMatcher(None, query, alias).ratio()
+
+
+def _find_champion_from_token(token: str, rows: list, used_ids: set) -> dict | None:
+    q = _normalize_lookup_text(token)
+    if not q:
+        return None
+    best = None
+    best_score = 0.0
+    for row in rows:
+        if row["api_name"] in used_ids:
+            continue
+        row_score = max((_score_champion_alias(q, alias) for alias in row["aliases"]), default=0.0)
+        if row_score > best_score:
+            best = row
+            best_score = row_score
+    threshold = 0.74 if re.search(r"[\u4e00-\u9fff]", token) else 0.80
+    if best is not None and best_score >= threshold:
+        return best
+    return None
+
+
+def _convert_text_fuzzy(text: str) -> dict:
+    from tft_converter import from_text
+
+    result = from_text(text, _effective_set_number())
+    if not result.get("error"):
+        result["_source"] = "text_fuzzy"
+    return result
+
 # ── HTML ───────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -83,14 +276,14 @@ HTML = r"""<!DOCTYPE html>
 <title>TFT 阵容顾问</title>
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=Noto+Sans+SC:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#09090f;--sur:#111118;--brd:#1e1e2e;--gold:#c8a84b;--gd2:#7a6230;
-  --teal:#3de8c8;--td2:#1a6b5e;--red:#e84040;--txt:#d4d4e8;--dim:#5a5a7a;--r:6px}
+:root{--bg:#eef6ff;--sur:#ffffff;--brd:#c8daf2;--gold:#2f6fda;--gd2:#8eb7ee;
+  --teal:#2563eb;--td2:#4f8ff7;--red:#dc4c64;--txt:#14324f;--dim:#6e88a6;--r:8px}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--txt);font-family:'Noto Sans SC',sans-serif;font-weight:300;
   min-height:100vh;display:flex;flex-direction:column}
 /* Header */
 header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-items:center;gap:10px;
-  background:linear-gradient(90deg,#0d0d18,#111120);flex-shrink:0}
+  background:linear-gradient(90deg,#f8fbff,#e8f2ff);flex-shrink:0}
 .logo{font-family:Rajdhani,sans-serif;font-size:18px;font-weight:700;
   letter-spacing:3px;color:var(--gold);text-transform:uppercase;white-space:nowrap}
 .logo span{color:var(--teal)}
@@ -124,7 +317,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 /* Common inputs */
 .drop-zone{border:2px dashed var(--brd);border-radius:var(--r);padding:20px 10px;
   text-align:center;cursor:pointer;color:var(--dim);font-size:12px;transition:.2s;flex-shrink:0}
-.drop-zone:hover,.drop-zone.over{border-color:var(--td2);color:var(--teal);background:#0b1a16}
+.drop-zone:hover,.drop-zone.over{border-color:var(--td2);color:var(--teal);background:#f2f8ff}
 .drop-zone .dz-icon{font-size:22px;margin-bottom:5px}
 .drop-zone small{display:block;margin-top:3px;font-size:10px;color:var(--dim)}
 .preview-img{width:100%;border-radius:var(--r);display:none;margin-top:6px;flex-shrink:0}
@@ -143,37 +336,40 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .ss-mode-btn{flex:1;min-width:50px;padding:5px 4px;border:1px solid var(--brd);border-radius:4px;
   background:transparent;color:var(--dim);font-size:10px;cursor:pointer;
   font-family:'Noto Sans SC',sans-serif;transition:.15s;white-space:nowrap}
-.ss-mode-btn.active{border-color:var(--td2);color:var(--teal);background:#0b1a16}
+.ss-mode-btn.active{border-color:var(--td2);color:#fff;background:var(--td2)}
 .ss-mode-btn:hover:not(.active){color:var(--txt);border-color:var(--brd)}
 .ss-mode-hint{font-size:10px;color:var(--dim);padding:2px 2px 0;flex-shrink:0;min-height:14px}
-.result-box{background:#0b1a16;border:1px solid var(--td2);border-radius:var(--r);
+.result-box{background:#f6fbff;border:1px solid var(--td2);border-radius:var(--r);
   padding:8px 10px;font-size:11px;line-height:1.7;color:var(--txt);display:none;flex-shrink:0}
 .result-box.show{display:block}
 .result-tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;
-  margin:2px;border:1px solid var(--td2);color:var(--teal);background:#061410}
+  margin:2px;border:1px solid var(--td2);color:var(--teal);background:#eef6ff}
+.result-tag.trait-active{border-color:var(--gold);color:var(--gold);background:#f8fbff}
+.result-tag.trait-near{border-color:#7aa7ee;color:#2f6fda;background:#edf5ff}
+.result-tag.trait-inactive{border-color:var(--brd);color:var(--dim);background:#f5f9ff}
 .lbl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}
 
 /* ── Builder ── */
-.builder-search{position:relative;flex-shrink:0}
+.builder-search{position:relative;flex-shrink:0;z-index:40}
 .builder-search input{width:100%;background:var(--bg);border:1px solid var(--brd);
   border-radius:var(--r);color:var(--txt);padding:7px 10px;font-size:12px;
   font-family:'Noto Sans SC',sans-serif;outline:none;transition:.2s}
 .builder-search input:focus{border-color:var(--td2)}
 .builder-search input::placeholder{color:var(--dim)}
 .champ-dropdown{background:var(--sur);border:1px solid var(--brd);border-radius:var(--r);
-  max-height:170px;overflow-y:auto;display:none;position:absolute;z-index:50;
-  width:100%;top:calc(100% + 2px);left:0;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+  max-height:320px;overflow-y:auto;display:none;position:absolute;z-index:120;
+  width:100%;top:calc(100% + 2px);left:0;box-shadow:0 12px 28px rgba(37,99,235,.16)}
 .champ-dropdown.show{display:block}
 .champ-item{display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;
-  transition:.1s;border-bottom:1px solid #1a1a28}
-.champ-item:hover{background:#0b1a16}
+  transition:.1s;border-bottom:1px solid #e3eefb}
+.champ-item:hover{background:#eef6ff}
 .champ-item:last-child{border-bottom:none}
 .champ-item img{width:28px;height:28px;border-radius:3px;object-fit:cover;flex-shrink:0}
 .champ-item .ci-name{font-size:12px;color:var(--txt)}
 .champ-item .ci-cost{font-size:10px;margin-left:auto}
 .c1{color:#aaa}.c2{color:#4caf50}.c3{color:#64b5f6}.c4{color:#ce93d8}.c5{color:#f1c40f}
 .roster-list{display:flex;flex-wrap:wrap;gap:5px;min-height:32px;flex-shrink:0}
-.roster-chip{display:flex;align-items:center;gap:4px;background:#0b1a16;border:1px solid var(--td2);
+.roster-chip{display:flex;align-items:center;gap:4px;background:#eef6ff;border:1px solid var(--td2);
   border-radius:4px;padding:3px 6px;cursor:pointer;font-size:10px;color:var(--teal);position:relative}
 .roster-chip img{width:22px;height:22px;border-radius:2px;object-fit:cover}
 .roster-chip .rc-del{font-size:9px;color:var(--red);margin-left:2px}
@@ -182,6 +378,8 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .roster-chip .rc-items{display:flex;gap:1px;align-items:center}
 .roster-chip .rc-star{font-size:9px;color:#f1c40f;margin-left:1px;cursor:pointer;padding:0 2px;user-select:none}
 .roster-chip .rc-star:hover{color:#fff}
+.roster-chip .rc-equip{font-size:9px;color:var(--teal);margin-left:2px;cursor:pointer;padding:0 2px;user-select:none}
+.roster-chip .rc-equip:hover{color:var(--gold)}
 /* builder control row */
 .builder-ctrl-row{display:flex;align-items:center;justify-content:space-between;
   flex-shrink:0;margin-top:4px;gap:4px}
@@ -192,7 +390,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   cursor:pointer;transition:.15s;background:var(--sur);overflow:hidden;
   position:relative;min-height:0;font-size:8px;color:var(--dim)}
-.hex-cell:hover{border-color:var(--td2);background:#0b1a16}
+.hex-cell:hover{border-color:var(--td2);background:#eef6ff}
 .hex-cell.occupied{border-style:solid}
 .hex-cell.cost1{border-color:#666}.hex-cell.cost2{border-color:#4caf50}
 .hex-cell.cost3{border-color:#64b5f6}.hex-cell.cost4{border-color:#ce93d8}
@@ -209,7 +407,13 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .hex-cell .remove-btn{position:absolute;top:1px;right:1px;background:rgba(200,0,0,.85);
   border:none;color:#fff;border-radius:2px;font-size:7px;cursor:pointer;
   padding:0 2px;line-height:13px;display:none;z-index:10}
+.hex-cell .equip-btn{position:absolute;top:1px;left:1px;background:rgba(79,143,247,.92);
+  border:none;color:#fff;border-radius:2px;font-size:7px;cursor:pointer;
+  padding:0 3px;line-height:13px;display:none;z-index:10}
 .hex-cell:hover .remove-btn{display:block}
+.hex-cell:hover .equip-btn{display:block}
+.hex-cell.drag-over{border-color:var(--teal);background:#dbeafe;box-shadow:0 0 0 2px rgba(37,99,235,.18) inset}
+.hex-cell.drag-src{opacity:.68}
 
 /* Item modal */
 .item-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:300;
@@ -229,8 +433,8 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .item-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;overflow-y:auto;flex:1}
 .item-thumb{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;
   padding:4px;border-radius:4px;border:1px solid transparent;transition:.15s}
-.item-thumb:hover{background:#0b1a16;border-color:var(--td2)}
-.item-thumb.selected{background:#0f2c22;border-color:var(--teal)}
+.item-thumb:hover{background:#eef6ff;border-color:var(--td2)}
+.item-thumb.selected{background:#dbeafe;border-color:var(--teal)}
 .item-thumb img{width:40px;height:40px;border-radius:4px;object-fit:cover}
 .item-thumb span{font-size:9px;color:var(--dim);text-align:center;
   word-break:break-all;line-height:1.2;max-width:56px}
@@ -241,9 +445,9 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .btn-c2{background:transparent;border:1px solid var(--brd);color:var(--dim)}.btn-c2:hover{color:var(--txt)}
 
 /* Right: chat */
-.chat-panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.chat-panel{flex:1;display:flex;flex-direction:column;overflow:hidden;background:linear-gradient(180deg,#fbfdff 0%,#eef6ff 100%)}
 .messages{flex:1;overflow-y:auto;padding:14px 18px;display:flex;
-  flex-direction:column;gap:12px;scroll-behavior:smooth}
+  flex-direction:column;gap:12px;scroll-behavior:smooth;background:linear-gradient(180deg,#f8fbff 0%,#eef6ff 100%)}
 .messages::-webkit-scrollbar{width:4px}
 .messages::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
 .msg{display:flex;gap:9px;max-width:820px;animation:fadeUp .2s ease}
@@ -252,39 +456,39 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .avatar{width:26px;height:26px;border-radius:4px;display:flex;align-items:center;
   justify-content:center;font-size:12px;flex-shrink:0}
-.msg.user .avatar{background:#1e1e38}.msg.ai .avatar{background:#0f1f1a;border:1px solid var(--td2)}
+.msg.user .avatar{background:#dbeafe}.msg.ai .avatar{background:#eef6ff;border:1px solid var(--td2)}
 .bubble{padding:9px 13px;border-radius:var(--r);font-size:13px;line-height:1.75;max-width:680px}
-.msg.user .bubble{background:#14142a;border:1px solid #252545;color:var(--txt)}
-.msg.ai   .bubble{background:#0b1a16;border:1px solid #1a3028;color:var(--txt)}
+.msg.user .bubble{background:#edf4ff;border:1px solid #c9dbf4;color:var(--txt)}
+.msg.ai   .bubble{background:#ffffff;border:1px solid #d6e6fb;color:var(--txt)}
 .bubble strong,.bubble b{color:var(--gold);font-weight:500}
 .bubble em,.bubble i{color:var(--teal);font-style:normal}
 .bubble h2,.bubble h3{color:var(--gold);font-family:Rajdhani,sans-serif;font-size:14px;letter-spacing:1px;margin:8px 0 3px}
 .bubble ul,.bubble ol{padding-left:16px;margin:4px 0}
 .bubble li{margin:2px 0}
-.bubble code{background:#1a1a2e;padding:1px 4px;border-radius:3px;font-size:11px;color:var(--teal);font-family:monospace}
+.bubble code{background:#edf4ff;padding:1px 4px;border-radius:3px;font-size:11px;color:var(--teal);font-family:monospace}
 .bubble hr{border:none;border-top:1px solid var(--brd);margin:7px 0}
 .bubble p{margin:3px 0}
 .thinking{display:flex;gap:5px;align-items:center;padding:11px 13px}
 .thinking span{width:5px;height:5px;background:var(--td2);border-radius:50%;animation:bounce 1.2s infinite}
 .thinking span:nth-child(2){animation-delay:.2s}.thinking span:nth-child(3){animation-delay:.4s}
 @keyframes bounce{0%,80%,100%{transform:scale(1);opacity:.5}40%{transform:scale(1.4);opacity:1}}
-.quick-bar{padding:0 16px 6px;display:flex;flex-wrap:wrap;gap:4px;flex-shrink:0}
+.quick-bar{padding:6px 16px 8px;display:flex;flex-wrap:wrap;gap:4px;flex-shrink:0;background:#f3f8ff}
 .qp{padding:3px 10px;border:1px solid var(--brd);border-radius:20px;background:transparent;
   color:var(--dim);font-size:11px;cursor:pointer;font-family:'Noto Sans SC',sans-serif;
   transition:.15s;white-space:nowrap}
-.qp:hover{border-color:var(--td2);color:var(--teal);background:#0b1a16}
+.qp:hover{border-color:var(--td2);color:var(--teal);background:#eef6ff}
 /* Simplified chat bar */
 .chat-bar{padding:8px 16px 12px;border-top:1px solid var(--brd);
-  display:flex;flex-direction:column;gap:6px;background:#0b0b14;flex-shrink:0}
+  display:flex;flex-direction:column;gap:6px;background:#f7fbff;flex-shrink:0}
 .chat-bar-top{display:flex;align-items:center;gap:8px}
 .mode-pills{display:flex;gap:4px}
 .mode-pill{padding:4px 12px;border:1px solid var(--brd);border-radius:20px;background:transparent;
   color:var(--dim);font-size:11px;cursor:pointer;font-family:'Noto Sans SC',sans-serif;
   transition:.15s;white-space:nowrap}
-.mode-pill.active{border-color:var(--td2);color:var(--teal);background:#0b1a16}
+.mode-pill.active{border-color:var(--td2);color:#fff;background:var(--td2)}
 .mode-pill:hover:not(.active){color:var(--txt)}
 .chat-bar-row{display:flex;gap:7px;align-items:flex-end}
-.chat-bar-row textarea{flex:1;background:#111118;border:1px solid var(--brd);border-radius:var(--r);
+.chat-bar-row textarea{flex:1;background:#ffffff;border:1px solid var(--brd);border-radius:var(--r);
   color:var(--txt);font-family:'Noto Sans SC',sans-serif;font-size:13px;font-weight:300;
   padding:8px 12px;resize:none;min-height:40px;max-height:120px;outline:none;line-height:1.6;transition:.2s}
 .chat-bar-row textarea:focus{border-color:var(--td2)}
@@ -296,7 +500,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 /* Welcome */
 .welcome{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:8px;color:var(--dim);padding:40px;text-align:center}
-.welcome h2{font-family:Rajdhani,sans-serif;font-size:22px;letter-spacing:2px;color:var(--gold);font-weight:600}
+.welcome h2{font-family:Rajdhani,sans-serif;font-size:22px;letter-spacing:2px;color:var(--teal);font-weight:600}
 .welcome p{font-size:12px;max-width:360px;line-height:1.7}
 /* Settings modal */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;
@@ -317,7 +521,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
 .modal-btn.save{background:var(--td2);color:#fff}.modal-btn.save:hover{background:var(--teal);color:var(--bg)}
 .modal-btn.cancel{background:transparent;border:1px solid var(--brd);color:var(--dim)}.modal-btn.cancel:hover{color:var(--txt)}
 /* Toast */
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0f2c22;
+ .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#edf5ff;
   border:1px solid var(--td2);border-radius:var(--r);padding:8px 18px;font-size:12px;
   color:var(--teal);z-index:400;opacity:0;transition:.3s;pointer-events:none;white-space:nowrap}
 .toast.show{opacity:1}
@@ -372,7 +576,7 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
     <div class="tab-pane" id="tab-text">
       <div class="lbl">英雄ID / JSON</div>
       <textarea class="inp-textarea" id="textInput"
-        placeholder="输入英雄英文 ID（逗号/空格分隔）或粘贴 JSON&#10;示例: Draven Kindred Sett Leona"></textarea>
+        placeholder="输入英雄中文名、英文名、简称，或直接粘贴 JSON&#10;示例: 贝蕾亚 阿卡丽 茂凯 / Briar Akali Maokai"></textarea>
       <button class="inp-submit" onclick="submitText()">📥 导入阵容</button>
       <div class="result-box" id="resTxt"></div>
     </div>
@@ -381,8 +585,8 @@ header{border-bottom:1px solid var(--brd);padding:10px 18px;display:flex;align-i
     <div class="tab-pane" id="tab-builder">
       <div class="lbl">搜索英雄</div>
       <div class="builder-search">
-        <input type="text" id="champSearch" placeholder="输入英雄名或职业标签..." autocomplete="off"
-               oninput="filterChamps(this.value)" onfocus="showDD()" onblur="hideDD()">
+        <input type="text" id="champSearch" placeholder="输入英雄中文名、英文名或羁绊..." autocomplete="off"
+               oninput="filterChamps(this.value)" onfocus="showDD()">
         <div class="champ-dropdown" id="champDD"></div>
       </div>
       <div class="builder-ctrl-row">
@@ -497,13 +701,15 @@ let currentMode='single', selectedFile=null, isThinking=false;
 let champDB=[], itemDB=[];
 let roster=[];  // [{api_name,name_en,cost,img_url,star,items,row,col}]
 let itemModalIdx=-1, itemModalSel=[];
+let dragBoardApiName='';
 let ssRecognizeMode='auto';   // 截图识别模式: auto|board|lineup|global|duel
 const DDRAGON_VER = '15.8.1';
 const SS_MODE_HINTS={
   auto:'自动检测截图类型',board:'棋盘视角（4行×7列）',
   lineup:'结算横排（水平一行）',global:'全局视角（8玩家总览）',duel:'对战双方对比'
 };
-function getChampName(c){ return (c.name_en||c.short_id||c.api_name||'').toString(); }
+function getChampName(c){ return (c.name_cn||c.name_en||c.short_id||c.api_name||'').toString(); }
+function getItemName(i){ return (i.name_cn||i.name_en||i.api_name||'').toString(); }
 function getChampImgUrl(c){ return c.img_url || `https://ddragon.leagueoflegends.com/cdn/${DDRAGON_VER}/img/tft-champion/${c.api_name}.png`; }
 function getItemImgUrl(i){ return i.img_url || `https://ddragon.leagueoflegends.com/cdn/${DDRAGON_VER}/img/tft-item/${i.api_name}.png`; }
 
@@ -588,7 +794,13 @@ async function submitScreenshot(){
   try{
     const d=await fetch('/api/input/screenshot',{method:'POST',body:fd}).then(r=>r.json());
     showResult('resSS',d);
-    if(d.ok) toast(`✓ 识别完成 · 模式: ${d.used_mode||ssRecognizeMode}`);
+    if(d.ok){
+      const used=d.used_mode||ssRecognizeMode;
+      const chatMode=(used==='global')?'global':((used==='duel')?'duel':'single');
+      const modeBtn=document.querySelector(`.mode-pill[onclick*="${chatMode}"]`);
+      if(modeBtn) setMode(chatMode,modeBtn);
+      toast(`✓ 识别完成 · 模式: ${used}`);
+    }
   }catch(e){toast('识别失败');}
   btn.disabled=false;btn.textContent='🔍 识别阵容';
 }
@@ -602,46 +814,69 @@ async function submitText(){
     showResult('resTxt',d);
   }catch(e){box.innerHTML='请求失败';}
 }
-
 // ── Champion dropdown ──────────────────────────────────────────────────────
+function normLookupText(v){
+  return (v||'').toString().toLowerCase().replace(/[\s\-_'/·.()（）\[\]{}]/g,'');
+}
+function champSearchScore(champ,q){
+  const qn=normLookupText(q);
+  if(!qn)return 0;
+  const fields=[getChampName(champ),champ.name_cn||'',champ.api_name,...(champ.traits||[])];
+  let best=0;
+  for(const field of fields){
+    const fn=normLookupText(field);
+    if(!fn) continue;
+    if(fn===qn) best=Math.max(best,1);
+    else if(fn.includes(qn) || qn.includes(fn)) best=Math.max(best,0.9 + Math.min(fn.length,qn.length)/Math.max(fn.length,qn.length,1)*0.06);
+    else {
+      let same=0;
+      for(const ch of qn){ if(fn.includes(ch)) same++; }
+      const ratio=same/Math.max(qn.length,fn.length,1);
+      if(ratio>best) best=ratio;
+    }
+  }
+  return best;
+}
 function renderDD(list){
   const dd=document.getElementById('champDD');
   if(!list||!list.length){dd.innerHTML='<div style="padding:8px;color:var(--dim);font-size:11px">无匹配英雄</div>';return;}
-  dd.innerHTML=list.slice(0,80).map(c=>{
+  dd.innerHTML=list.map(c=>{
     const nameEn=getChampName(c);
     const nameCn=c.name_cn||'';
-    const display=nameCn?`${nameEn} <span style="color:var(--dim)">${nameCn}</span>`:nameEn;
-    const traits=(c.traits||[]).slice(0,2).map(t=>`<span style="font-size:8px;color:var(--dim);background:#1a1a28;padding:0 3px;border-radius:2px">${t}</span>`).join('');
-    const localBadge=c.local?'<span style="font-size:7px;color:#2ecc71;margin-left:2px">●</span>':'';
-    return `<div class="champ-item" onmousedown="addChamp('${c.api_name}')">
-      <img src="${getChampImgUrl(c)}" alt="${nameEn}" width="28" height="28"
-           onerror="this.onerror=null;this.src='https://ddragon.leagueoflegends.com/cdn/${DDRAGON_VER}/img/tft-champion/${c.api_name}.png'">
-      <span class="ci-name">${display}${traits?'&nbsp;'+traits:''}${localBadge}</span>
-      <span class="ci-cost c${c.cost}">${c.cost}费</span>
-    </div>`;
+    const showDual=!!(nameCn && nameCn!==nameEn);
+    const display=showDual?`${nameEn} <span style="color:var(--dim)">${nameCn}</span>`:nameEn;
+    const traits=(c.traits||[]).slice(0,2).map(t=>`<span style="font-size:8px;color:var(--dim);background:#edf4ff;padding:0 3px;border-radius:2px">${t}</span>`).join('');
+    const localBadge=c.local?'<span style="font-size:7px;color:#2563eb;margin-left:2px">●</span>' : '';
+    return [
+      `<div class="champ-item" onmousedown="addChamp('${c.api_name}')">`,
+      `  <img src="${getChampImgUrl(c)}" alt="${nameEn}" width="28" height="28"`,
+      `       onerror="this.onerror=null;this.src='https://ddragon.leagueoflegends.com/cdn/${DDRAGON_VER}/img/tft-champion/${c.api_name}.png'">`,
+      `  <span class="ci-name">${display}${traits?'&nbsp;'+traits:''}${localBadge}</span>`,
+      `  <span class="ci-cost c${c.cost}">${c.cost}费</span>`,
+      `</div>`
+    ].join('');
   }).join('');
 }
 function filterChamps(q){
-  if(!q){ showDD(); return; }  // empty → show all via showDD
-  const ql=q.toLowerCase();
-  const f=champDB.filter(c=>{
-    const name=getChampName(c).toLowerCase();
-    const cn=(c.name_cn||'').toLowerCase();
-    return name.includes(ql)||cn.includes(ql)||
-      c.api_name.toLowerCase().includes(ql)||
-      (c.traits||[]).some(t=>t.toLowerCase().includes(ql));
-  });
-  renderDD(f);
-  document.getElementById('champDD').classList.toggle('show',f.length>0);
-}
-// 输入框点击时显示全量英雄（方便浏览）
-function showDD(){
-  const q=document.getElementById('champSearch').value;
   const dd=document.getElementById('champDD');
-  if(!q){ renderDD(champDB.slice(0,40)); }
+  if(!q){ renderDD(champDB); dd.classList.toggle('show',champDB.length>0); return; }
+  const scored=champDB.map(c=>({champ:c,score:champSearchScore(c,q)}))
+    .filter(x=>x.score>=0.34)
+    .sort((a,b)=>b.score-a.score || (a.champ.cost||1)-(b.champ.cost||1) || getChampName(a.champ).localeCompare(getChampName(b.champ),'zh-CN'))
+    .map(x=>x.champ);
+  renderDD(scored);
+  dd.classList.toggle('show',scored.length>0);
+}
+function showDD(){
+  const dd=document.getElementById('champDD');
+  renderDD(champDB);
   if(champDB.length>0) dd.classList.add('show');
 }
-function hideDD(){ setTimeout(()=>document.getElementById('champDD').classList.remove('show'),150); }
+function hideDD(){ document.getElementById('champDD').classList.remove('show'); }
+document.addEventListener('click',e=>{
+  const wrap=document.querySelector('.builder-search');
+  if(wrap && !wrap.contains(e.target)) hideDD();
+});
 
 function addChamp(apiName){
   if(roster.length>=9){toast('最多9名英雄');return;}
@@ -669,20 +904,21 @@ function renderRoster(){
     const name=getChampName(c);
     const itemIcons=(c.items||[]).slice(0,3).map(n=>{
       const it=itemDB.find(i=>i.api_name===n);
-      return it?`<img src="${getItemImgUrl(it)}" title="${it.name_en||it.api_name}" width="12" height="12" style="border-radius:2px;object-fit:cover" onerror="this.style.display='none'">`:'';
+      if(!it) return '';
+      const itemName=getItemName(it);
+      return `<img src="${getItemImgUrl(it)}" alt="${itemName}" title="${itemName}" width="12" height="12" style="border-radius:2px;object-fit:cover" onerror="this.style.display='none'">`;
     }).join('');
-    return `<div class="roster-chip">
-      <img src="${getChampImgUrl(c)}" alt="${name}" title="${name} — 点击装备"
-           onerror="this.onerror=null;this.style.opacity='.3'"
-           onclick="event.stopPropagation();openItemModal('${c.api_name}')">
-      <span class="rc-name">${name.length>7?name.slice(0,6)+'\u2026':name}</span>
-      <span class="rc-star" title="点击切换星级"
-            onclick="event.stopPropagation();cycleChampStar('${c.api_name}')">${stars}</span>
+    return `<div class="roster-chip" title="点击设置星级、装备或删除">
+      <img src="${getChampImgUrl(c)}" alt="${name}" title="${name}" onerror="this.onerror=null;this.style.opacity='0.35'">
+      <span class="rc-name">${name.length>7?name.slice(0,6)+'…':name}</span>
+      <span class="rc-star" title="点击切换星级" onclick="event.stopPropagation();cycleChampStar('${c.api_name}')">${stars}</span>
+      <span class="rc-equip" title="选择装备" onclick="event.stopPropagation();openItemModal('${c.api_name}')">装</span>
       ${itemIcons?`<span class="rc-items">${itemIcons}</span>`:''}
-      <span class="rc-del" onclick="event.stopPropagation();removeChamp('${c.api_name}')">✕</span>
+      <span class="rc-del" title="删除英雄" onclick="event.stopPropagation();removeChamp('${c.api_name}')">✕</span>
     </div>`;
   }).join('');
 }
+
 function cycleChampStar(apiName){
   const c=roster.find(x=>x.api_name===apiName);if(!c)return;
   c.star=c.star>=3?1:c.star+1;
@@ -697,31 +933,70 @@ function initHexBoard(){
     cell.className='hex-cell';cell.dataset.row=row;cell.dataset.col=col;
     cell.textContent=`${row},${col}`;
     cell.onclick=()=>boardClick(row,col);
+    cell.ondragover=e=>{e.preventDefault();cell.classList.add('drag-over');};
+    cell.ondragleave=()=>cell.classList.remove('drag-over');
+    cell.ondrop=e=>{e.preventDefault();cell.classList.remove('drag-over');boardDrop(row,col);};
     board.appendChild(cell);
   }
 }
 function renderBoard(){
   const cells=document.querySelectorAll('.hex-cell');
-  cells.forEach(c=>{c.className='hex-cell';c.innerHTML=`<span>${c.dataset.row},${c.dataset.col}</span>`;});
+  cells.forEach(c=>{
+    c.className='hex-cell';
+    c.innerHTML=`<span>${c.dataset.row},${c.dataset.col}</span>`;
+    c.draggable=false;
+    c.ondragstart=null;
+    c.ondragend=null;
+  });
   roster.forEach(champ=>{
     const idx=champ.row*7+champ.col;if(idx<0||idx>=cells.length)return;
     const cell=cells[idx];
     cell.className=`hex-cell occupied cost${champ.cost||1}`;
+    cell.draggable=true;
+    cell.ondragstart=e=>boardDragStart(e,champ.api_name);
+    cell.ondragend=()=>boardDragEnd();
     const stars=champ.star>1?`<div class="star-row">${'<span class="star">★</span>'.repeat(champ.star)}</div>`:'';
     const items=(champ.items||[]).map(n=>{
       const it=itemDB.find(i=>i.api_name===n);
-      return it?`<img class="item-icon" src="${getItemImgUrl(it)}" alt="${it.name_en||it.api_name}" onerror="this.style.display='none'">`:'' ;
+      return it?`<img class="item-icon" src="${getItemImgUrl(it)}" alt="${getItemName(it)}" draggable="false" onerror="this.style.display='none'">`:'' ;
     }).join('');
     const name=getChampName(champ);
     cell.innerHTML=`
       ${stars}
-      <img class="champ-portrait" src="${getChampImgUrl(champ)}" alt="${name}"
+      <img class="champ-portrait" src="${getChampImgUrl(champ)}" alt="${name}" draggable="false"
            onerror="this.onerror=null;this.src='https://ddragon.leagueoflegends.com/cdn/${DDRAGON_VER}/img/tft-champion/${champ.api_name}.png'"
            onclick="event.stopPropagation();openItemModal('${champ.api_name}')">
       ${items?`<div class="item-row">${items}</div>`:''}
       <div class="champ-name">${name}</div>
+      <button class="equip-btn" onclick="event.stopPropagation();openItemModal('${champ.api_name}')">装</button>
       <button class="remove-btn" onclick="event.stopPropagation();removeChamp('${champ.api_name}')">✕</button>`;
   });
+}
+function boardDragStart(e,apiName){
+  dragBoardApiName=apiName;
+  const cell=e.currentTarget;
+  if(cell) cell.classList.add('drag-src');
+  if(e.dataTransfer){
+    e.dataTransfer.effectAllowed='move';
+    e.dataTransfer.setData('text/plain',apiName);
+  }
+}
+function boardDragEnd(){
+  dragBoardApiName='';
+  document.querySelectorAll('.hex-cell').forEach(c=>c.classList.remove('drag-over','drag-src'));
+}
+function boardDrop(row,col){
+  const apiName=dragBoardApiName;
+  if(!apiName)return;
+  const src=roster.find(x=>x.api_name===apiName);
+  if(!src) return;
+  if(src.row===row && src.col===col) return boardDragEnd();
+  const dst=roster.find(x=>x.row===row&&x.col===col);
+  const prev={row:src.row,col:src.col};
+  src.row=row;src.col=col;
+  if(dst){ dst.row=prev.row; dst.col=prev.col; }
+  renderBoard();
+  boardDragEnd();
 }
 function boardClick(row,col){
   const c=roster.find(x=>x.row===row&&x.col===col);
@@ -760,19 +1035,20 @@ function _currentItemList(){
 function renderItemGrid(list){
   const grid=document.getElementById('itemGrid');if(!grid)return;
   grid.innerHTML=(list||[]).map(it=>{
-    const nameEn=it.name_en||it.api_name||'';
-    const nameCn=it.name_cn||'';
-    const short=nameEn.length>10?nameEn.slice(0,9)+'…':nameEn;
+    const itemName=getItemName(it);
+    const subName=(it.name_en&&it.name_en!==itemName)?it.name_en:'';
+    const short=itemName.length>10?itemName.slice(0,9)+'…':itemName;
     const localDot=it.local?'<i style="font-size:6px;color:#2ecc71;position:absolute;top:1px;right:1px;font-style:normal">●</i>':'';
     return `<div class="item-thumb ${itemModalSel.includes(it.api_name)?'selected':''}"
-         style="position:relative" title="${nameEn}${nameCn?' / '+nameCn:''}"
+         style="position:relative" title="${subName?itemName+' / '+subName:itemName}"
          onclick="event.stopPropagation();toggleItem('${it.api_name}')">
       ${localDot}
-      <img src="${getItemImgUrl(it)}" alt="${nameEn}" onerror="this.onerror=null;this.style.opacity='.3'">
+      <img src="${getItemImgUrl(it)}" alt="${itemName}" onerror="this.onerror=null;this.style.opacity='.3'">
       <span>${short}</span>
     </div>`;
   }).join('');
 }
+
 function toggleItem(apiName){
   if(itemModalSel.includes(apiName)){
     itemModalSel=itemModalSel.filter(i=>i!==apiName);
@@ -787,7 +1063,7 @@ function updateItemPrev(){
   const p=document.getElementById('selItemsPrev');
   p.innerHTML=itemModalSel.length?itemModalSel.map(n=>{
     const it=itemDB.find(i=>i.api_name===n);
-    return it?`<img src="${it.img_url}" title="${it.name_en}" onerror="this.style.display='none'" width="22" height="22" style="border-radius:3px;object-fit:cover">`:'';
+    return it?`<img src="${getItemImgUrl(it)}" title="${getItemName(it)}" onerror="this.style.display='none'" width="22" height="22" style="border-radius:3px;object-fit:cover">`:'';
   }).join(''):'<span>未选择装备</span>';
 }
 function confirmItems(){
@@ -812,12 +1088,48 @@ async function submitBuilder(){
 function showResult(boxId,d){
   const box=document.getElementById(boxId);box.classList.add('show');
   if(d.ok){
-    const a=d.analysis;
-    const ctags=(a.champions||[]).map(c=>`<span class="result-tag">${c.name_en||c.short_id} ${c.star}★</span>`).join('');
-    const ttags=(a.traits||[]).filter(t=>t.active||t.count>0).map(t=>
-      `<span class="result-tag" style="border-color:var(--gold);color:var(--gold)">${t.name_en}(${t.count})</span>`).join('');
-    box.innerHTML=`<strong>✓ ${a.champion_count} 名英雄</strong><br>${ctags}${ttags?'<br>'+ttags:''}`;
-    hideWelcome();toast(`✓ 已导入 ${a.champion_count} 名英雄`);
+    const a=d.analysis||{};
+    const renderChampTags=list=>(list||[]).map(c=>`<span class="result-tag">${c.name_en||c.short_id||c.id||'?'} ${c.star||1}★</span>`).join('');
+    const renderTraitTags=list=>(list||[]).filter(t=>t.count>0).map(t=>{
+      const active=!!t.active;
+      const need=Math.max(0,(t.next_threshold||0)-(t.count||0));
+      const near=!active && need===1;
+      const cls=active?'trait-active':(near?'trait-near':'trait-inactive');
+      const badge=active
+        ? `${t.name_en||t.id||'?'} ${t.count||0}${t.level_name?` · ${t.level_name}`:''}`
+        : `${t.name_en||t.id||'?'} ${t.count||0}/${t.next_threshold||'?'}`;
+      const hint=active
+        ? `已激活${t.level_name?` ${t.level_name}`:''}${(t.thresholds||[]).length?` · 阈值 ${t.thresholds.join('/')}`:''}`
+        : `未激活 · 还差 ${need} 个 · 阈值 ${(t.thresholds||[]).join('/')||'未知'}`;
+      return `<span class="result-tag ${cls}" title="${hint}">${badge}</span>`;
+    }).join('');
+
+    if(a.layout==='global' && (a.players||[]).length){
+      const rows=(a.players||[]).map(p=>{
+        const champs=renderChampTags(p.champions||[]);
+        const traits=renderTraitTags(p.traits||[]);
+        return `<div style="margin-top:6px"><strong>第${p.rank}名</strong> · ${p.champion_count||0} 名英雄${champs?`<br>${champs}`:''}${traits?`<br>${traits}`:''}</div>`;
+      }).join('');
+      box.innerHTML=`<strong>✓ 全局识别 ${a.player_count||0} 名玩家 / ${a.champion_count||0} 名英雄</strong>${a.contested&&a.contested.length?`<br><span style="color:var(--dim)">争抢: ${a.contested.join(' / ')}</span>`:''}${rows}`;
+      hideWelcome();toast(`✓ 已导入全局视角 · ${a.player_count||0} 名玩家`);
+      return;
+    }
+
+    if(a.layout==='duel' && (a.boards||[]).length){
+      const boards=(a.boards||[]).map(b=>{
+        const champs=renderChampTags(b.champions||[]);
+        const traits=renderTraitTags(b.traits||[]);
+        return `<div style="margin-top:6px"><strong>${b.label||('棋盘'+(b.board_idx||0))}</strong> · ${b.champion_count||0} 名英雄${champs?`<br>${champs}`:''}${traits?`<br>${traits}`:''}</div>`;
+      }).join('');
+      box.innerHTML=`<strong>✓ 对战识别 ${a.board_count||0} 个棋盘 / ${a.champion_count||0} 名英雄</strong>${boards}`;
+      hideWelcome();toast(`✓ 已导入对战视角 · ${a.board_count||0} 个棋盘`);
+      return;
+    }
+
+    const ctags=renderChampTags(a.champions||[]);
+    const ttags=renderTraitTags(a.traits||[]);
+    box.innerHTML=`<strong>✓ ${a.champion_count||0} 名英雄</strong><br>${ctags}${ttags?'<br>'+ttags:''}`;
+    hideWelcome();toast(`✓ 已导入 ${a.champion_count||0} 名英雄`);
   }else{
     box.innerHTML=`<span style="color:var(--red)">✗ ${d.error||'失败'}</span>`;
   }
@@ -925,47 +1237,54 @@ def api_kb_refresh():
 @app.route("/api/data/champions")
 def api_data_champions():
     db = _load_db("champion_db_file", "tft_champion_db.json", "./tft_rag_data/tft_champion_db.json")
-    set_n = rag.CFG.get("current_set", 16)
+    set_n = _effective_set_number()
     champs = []
     for api_name, info in db.items():
-        if not (api_name.startswith(f"TFT{set_n}_") or api_name.startswith("TFT16_")):
+        if not _current_set_only(api_name, set_n):
             continue
-        name = info.get("name_en") or info.get("short_id") or api_name
-        cost = info.get("cost", 1)
+        short_id, name_en, name_cn = _champion_names(info, api_name, set_n)
+        try:
+            cost = int(info.get("cost", 1) or 1)
+        except Exception:
+            cost = 1
+        local_url = _local_img_url("champions", api_name, name_cn, name_en, short_id)
         champs.append({
             "api_name": api_name,
-            "name_en" : name,
-            "cost"    : cost,
-            "traits"  : info.get("traits", [])[:4],
-            "img_url" : _champ_img(api_name),
+            "short_id": short_id,
+            "name_en": name_en,
+            "name_cn": name_cn,
+            "cost": cost,
+            "traits": [_fix_mojibake_text(t) for t in info.get("traits", [])[:4]],
+            "img_url": local_url or _champ_img(api_name),
+            "local": local_url is not None,
         })
-    champs.sort(key=lambda c: (c["cost"], c["name_en"]))
+    champs.sort(key=lambda c: (c["cost"], c["name_cn"] or c["name_en"]))
     return jsonify({"ok": True, "champions": champs})
-
 
 @app.route("/api/data/items")
 def api_data_items():
     db = _load_db("item_db_file", "tft_item_db.json", "./tft_rag_data/tft_item_db.json")
-    SKIP_WORDS = {"tutorial","consumable","debug","grant","random","explorer",
+    skip_words = {"tutorial","consumable","debug","grant","random","explorer",
                   "placeholder","elusive","support","hextech","dummy","training"}
     items = []
     for api_name, info in db.items():
-        name = info.get("name_en", api_name)
-        key  = api_name.lower()
-        if any(w in key for w in SKIP_WORDS):
+        name_en, name_cn = _item_names(info, api_name)
+        key = api_name.lower()
+        probe = (name_cn or name_en).lower()
+        if any(w in key for w in skip_words) or any(w in probe for w in skip_words):
             continue
-        if any(w in name.lower() for w in SKIP_WORDS):
+        if not (name_cn or name_en) or (name_en == api_name and not name_cn):
             continue
-        if name in ("", "???", api_name):
-            continue
+        local_url = _local_img_url("items", api_name, name_cn, name_en)
         items.append({
             "api_name": api_name,
-            "name_en" : name,
-            "img_url" : _item_img(api_name),
+            "name_en": name_en,
+            "name_cn": name_cn,
+            "img_url": local_url or _item_img(api_name),
+            "local": local_url is not None,
         })
-    items.sort(key=lambda i: i["name_en"])
+    items.sort(key=lambda i: (i["name_cn"] or i["name_en"]))
     return jsonify({"ok": True, "items": items})
-
 
 # ── Input endpoints ─────────────────────────────────────────────────────────
 @app.route("/api/settings", methods=["POST"])
@@ -1006,7 +1325,7 @@ def api_input_screenshot():
     img_bytes  = request.files["image"].read()
     # 前端传入的识别模式（auto/board/lineup/global/duel）
     user_mode  = request.form.get("mode", "auto").strip().lower()
-    recognize_mode = None if user_mode == "auto" else user_mode
+    recognize_mode = user_mode or "auto"
     try:
         from tft_screen_capture_yolo_clip import recognize
         result = recognize(img_bytes, mode=recognize_mode)
@@ -1031,8 +1350,6 @@ def api_input_screenshot():
     _save_analysis(result)
     return jsonify({"ok": True, "analysis": _summarize(result),
                     "raw": result, "used_mode": used_mode})
-
-
 @app.route("/api/input/text", methods=["POST"])
 def api_input_text():
     data = request.get_json(force=True)
@@ -1041,7 +1358,14 @@ def api_input_text():
         return jsonify({"ok": False, "error": "Empty input"}), 400
     try:
         from tft_converter import convert
-        result = convert(text)
+        if text.startswith(("[", "{")):
+            result = convert(text, set_num=_effective_set_number())
+        else:
+            result = _convert_text_fuzzy(text)
+            if result.get("error"):
+                fallback = convert(text, set_num=_effective_set_number())
+                if not fallback.get("error"):
+                    result = fallback
     except ImportError:
         return jsonify({"ok": False, "error": "tft_converter.py 未找到"})
     except Exception as e:
@@ -1062,7 +1386,7 @@ def api_input_builder():
 
     champ_db = _load_db("champion_db_file", "tft_champion_db.json",
                         "./tft_rag_data/tft_champion_db.json")
-    set_n    = rag.CFG.get("current_set", 16)
+    set_n    = _effective_set_number()
 
     champions = []
     for u in units:
@@ -1104,31 +1428,122 @@ def _save_analysis(result: dict):
 
 
 def _summarize(result: dict) -> dict:
+    layout = result.get("_layout") or "single"
+
+    def champ_summary(champs: list) -> list:
+        return [
+            {"id": c.get("id", ""), "short_id": c.get("short_id", ""),
+             "name_en": c.get("name_en", ""), "star": c.get("star", 1), "cost": c.get("cost", 0)}
+            for c in champs if c.get("id")
+        ]
+
+    def trait_summary(traits: list) -> list:
+        rows = []
+        for t in traits:
+            count = int(t.get("count", 0) or 0)
+            thresholds = [int(x) for x in (t.get("thresholds") or []) if str(x).isdigit() or isinstance(x, int)]
+            thresholds = sorted(dict.fromkeys(thresholds))
+            active = int(t.get("level", 0) or 0) > 0 or int(t.get("tier", 0) or 0) > 0
+            next_threshold = next((lvl for lvl in thresholds if lvl > count), 0)
+            rows.append({
+                "id": t.get("id", ""),
+                "name_en": t.get("name_en") or t.get("name") or t.get("short_id", ""),
+                "count": count,
+                "active": active,
+                "level": int(t.get("level", 0) or 0),
+                "level_name": t.get("level_name", "") or "",
+                "thresholds": thresholds,
+                "next_threshold": next_threshold,
+            })
+        return rows
+
+    if layout == "global":
+        players = result.get("players", []) or []
+        player_rows = []
+        all_names = []
+        from collections import Counter
+        for idx, player in enumerate(players, 1):
+            champs = champ_summary(player.get("champions", []))
+            traits = trait_summary(player.get("traits", []))
+            player_rows.append({
+                "rank": player.get("rank", idx),
+                "label": player.get("label") or player.get("player_name") or player.get("name") or f"第{idx}名",
+                "champion_count": len(champs),
+                "champions": champs,
+                "traits": traits,
+            })
+            all_names.extend([c.get("name_en") or c.get("short_id") for c in champs if c.get("id")])
+        contested = [name for name, cnt in Counter([n for n in all_names if n]).most_common(6) if cnt >= 2]
+        return {
+            "layout": "global",
+            "player_count": len(player_rows),
+            "champion_count": sum(p["champion_count"] for p in player_rows),
+            "players": player_rows,
+            "contested": contested,
+        }
+
+    if layout == "duel":
+        boards = result.get("boards", []) or []
+        board_rows = []
+        for idx, board in enumerate(boards):
+            champs = champ_summary(board.get("champions", []))
+            traits = trait_summary(board.get("traits", []))
+            board_rows.append({
+                "board_idx": board.get("board_idx", idx),
+                "label": board.get("label") or ("self" if idx else "opponent"),
+                "champion_count": len(champs),
+                "champions": champs,
+                "traits": traits,
+            })
+        return {
+            "layout": "duel",
+            "board_count": len(board_rows),
+            "champion_count": sum(b["champion_count"] for b in board_rows),
+            "boards": board_rows,
+        }
+
     champs = result.get("champions", [])
     traits = result.get("traits", [])
     return {
+        "layout": layout,
         "champion_count": len([c for c in champs if c.get("id")]),
-        "champions": [
-            {"id": c.get("id",""), "short_id": c.get("short_id",""),
-             "name_en": c.get("name_en",""), "star": c.get("star",1), "cost": c.get("cost",0)}
-            for c in champs if c.get("id")
-        ],
-        "traits": [
-            {"id": t.get("id",""), "name_en": t.get("name_en",""),
-             "count": t.get("count",0), "active": t.get("level",0) > 0}
-            for t in traits
-        ],
+        "champions": champ_summary(champs),
+        "traits": trait_summary(traits),
     }
 
 
 # -- Local asset routes --------------------------------------------------------
 
-def _local_img_url(subfolder, stem):
-    for ext in ('.png', '.jpg', '.webp'):
-        if (ASSETS_DIR / subfolder / (stem + ext)).exists():
-            return '/api/assets/img/' + subfolder + '/' + stem + ext
-    return None
+def _local_img_url(subfolder, stem, *names):
+    folder = ASSETS_DIR / subfolder
+    if not folder.exists():
+        return None
 
+    suffixes = (".png", ".jpg", ".jpeg", ".webp")
+    candidates = []
+
+    def add_candidate(value: str):
+        value = _clean_match_text(value)
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add_candidate(stem)
+    for name in names:
+        add_candidate(name)
+
+    for value in candidates:
+        for ext in suffixes:
+            exact = folder / f"{value}{ext}"
+            if exact.exists():
+                return f"/api/assets/img/{subfolder}/{exact.name}"
+
+    stem_prefix = stem.rsplit("_", 1)[0] if "_" in stem else stem
+    for name in candidates[1:]:
+        for pattern in (f"{stem}_{name}*", f"{stem_prefix}_{name}*", f"{name}*"):
+            for candidate in sorted(folder.glob(pattern)):
+                if candidate.suffix.lower() in suffixes:
+                    return f"/api/assets/img/{subfolder}/{candidate.name}"
+    return None
 
 @app.route('/api/assets/img/<path:rel_path>')
 def api_assets_img(rel_path):
@@ -1145,67 +1560,56 @@ def api_assets_img(rel_path):
 @app.route('/api/assets/champions')
 def api_assets_champions():
     db    = _load_db('champion_db_file', 'tft_champion_db.json', './tft_rag_data/tft_champion_db.json')
-    set_n = rag.CFG.get('current_set', 16)
+    set_n = _effective_set_number()
     champs = []
     for api_name, info in db.items():
-        # 过滤：只保留 TFT 开头的正式英雄，跳过道具/系统 key
         if not api_name.startswith('TFT'):
             continue
-        # 优先匹配当前赛季；若 db 里没有赛季前缀也全量返回
-        if '_' in api_name:
-            prefix = api_name.split('_')[0]  # e.g. "TFT16"
-            try:
-                db_set = int(prefix[3:])
-                if db_set != set_n and db_set != 16:
-                    continue
-            except ValueError:
-                pass
-        name_en = info.get('name_en') or info.get('short_id') or ''
-        name_cn = info.get('name_cn') or info.get('name_zh') or ''
-        display  = name_en or name_cn or api_name
-        cost = info.get('cost', 1)
-        if not isinstance(cost, int) or cost < 1:
+        if not _current_set_only(api_name, set_n):
+            continue
+        short_id, name_en, name_cn = _champion_names(info, api_name, set_n)
+        try:
+            cost = int(info.get('cost', 1) or 1)
+        except Exception:
             cost = 1
-        local_url = _local_img_url('champions', api_name)
+        local_url = _local_img_url('champions', api_name, name_cn, name_en, short_id)
         champs.append({
             'api_name': api_name,
-            'name_en' : display,
+            'short_id': short_id,
+            'name_en' : name_en,
             'name_cn' : name_cn,
             'cost'    : cost,
-            'traits'  : info.get('traits', [])[:4],
+            'traits'  : [_fix_mojibake_text(t) for t in info.get('traits', [])[:4]],
             'img_url' : local_url or _champ_img(api_name),
             'local'   : local_url is not None,
         })
-    champs.sort(key=lambda c: (c['cost'], c['name_en']))
+    champs.sort(key=lambda c: (c['cost'], c['name_cn'] or c['name_en']))
     return jsonify({'ok': True, 'champions': champs, 'count': len(champs)})
-
 
 @app.route('/api/assets/items')
 def api_assets_items():
     db = _load_db('item_db_file', 'tft_item_db.json', './tft_rag_data/tft_item_db.json')
-    SKIP = {'tutorial','consumable','debug','grant','random','explorer',
+    skip = {'tutorial','consumable','debug','grant','random','explorer',
             'placeholder','elusive','support','dummy','training'}
     items = []
     for api_name, info in db.items():
-        name_en = info.get('name_en', '') or ''
-        name_cn = info.get('name_cn') or info.get('name_zh') or ''
-        name    = name_en or name_cn
-        key     = api_name.lower()
-        if any(w in key for w in SKIP) or any(w in name.lower() for w in SKIP):
+        name_en, name_cn = _item_names(info, api_name)
+        probe = (name_cn or name_en).lower()
+        key = api_name.lower()
+        if any(w in key for w in skip) or any(w in probe for w in skip):
             continue
-        if not name or name in ('???',):
+        if not (name_cn or name_en) or (name_en == api_name and not name_cn):
             continue
-        local_url = _local_img_url('items', api_name)
+        local_url = _local_img_url('items', api_name, name_cn, name_en)
         items.append({
             'api_name': api_name,
-            'name_en' : name_en or api_name,
+            'name_en' : name_en,
             'name_cn' : name_cn,
             'img_url' : local_url or _item_img(api_name),
             'local'   : local_url is not None,
         })
-    items.sort(key=lambda i: i['name_en'])
+    items.sort(key=lambda i: (i['name_cn'] or i['name_en']))
     return jsonify({'ok': True, 'items': items, 'count': len(items)})
-
 
 @app.route("/api/recommend", methods=["POST"])
 def api_recommend():
@@ -1233,3 +1637,12 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════╝
 """)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+
+
+
+
+
+
+

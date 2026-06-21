@@ -1,407 +1,625 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 tft_converter.py
-阵容格式转换 + 羁绊计算 + 摘要生成
 
-支持输入格式：
-  1. Riot 对局 JSON（participant.units 列表）
-  2. 截图识别结果（tft_screen_capture 输出）
-  3. 自由文本（英文 ID 列表，需配合 champion DB）
-  4. 手动 JSON
-
-输出格式（标准化 JSON）：
-  {
-    "team_size": int,
-    "champions": [{ "id", "short_id", "name_en", "star", "cost", "items", "position" }],
-    "traits":    [{ "id", "name_en", "count", "level", "level_name" }],
-    "summary":   { "front_row_ratio", "main_carry", "equipment_ok" },
-    "equipment_issues": [str],
-    "_source": str
-  }
+Normalize TFT inputs from Riot JSON, free-form text, and image recognition.
 """
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# ──────────────────────────────────────────────────────────────
-# 辅助：ID 规范化
-# ──────────────────────────────────────────────────────────────
 def strip_prefix(s: str) -> str:
-    return re.sub(r"^(?:TFT(?:Set)?\d*_(?:Item_)?|TFT_)", "", s)
+    return re.sub(r"^(?:TFT(?:Set)?\d*_(?:Item_)?|TFT_)", "", s or "")
 
 
 def normalize_champ_id(raw: str, set_num: int = 16) -> str:
-    """将任意格式 ID 规范化为 TFT{set_num}_{Name}"""
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if re.match(rf"^TFT{set_num}_", raw):
         return raw
     clean = strip_prefix(raw)
-    return f"TFT{set_num}_{clean}"
+    return f"TFT{set_num}_{clean}" if clean else raw
 
 
 def normalize_item_id(raw: str) -> str:
-    """将任意格式装备 ID 规范化为 TFT_Item_{Name}"""
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if raw.startswith("TFT_Item_"):
         return raw
     clean = strip_prefix(raw)
-    return f"TFT_Item_{clean}"
+    return f"TFT_Item_{clean}" if clean else raw
 
 
-# ──────────────────────────────────────────────────────────────
-# 加载本地数据库（懒加载）
-# ──────────────────────────────────────────────────────────────
-_champion_db: Optional[Dict] = None
-_trait_db:    Optional[Dict] = None
-_item_db:     Optional[Dict] = None
-_trait_dict:  Optional[Dict] = None
+_champion_db: Optional[Dict[str, Dict[str, Any]]] = None
+_trait_db: Optional[Dict[str, Dict[str, Any]]] = None
+_item_db: Optional[Dict[str, Dict[str, Any]]] = None
+_trait_dict: Optional[Dict[str, Dict[str, Any]]] = None
+_champion_trait_map: Optional[Dict[str, List[str]]] = None
 
 
-def _load_db():
-    global _champion_db, _trait_db, _item_db, _trait_dict
+def _load_db() -> None:
+    global _champion_db, _trait_db, _item_db, _trait_dict, _champion_trait_map
     if _champion_db is not None:
         return
 
-    def _read(path: str) -> Dict:
+    def _read(path: str) -> Dict[str, Any]:
         p = Path(path)
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
     _champion_db = _read("tft_champion_db.json")
-    _trait_db    = _read("tft_trait_db.json")
-    _item_db     = _read("tft_item_db.json")
-    _trait_dict  = _read("tft_trait_champion_dict.json")
+    _trait_db = _read("tft_trait_db.json")
+    _item_db = _read("tft_item_db.json")
+    _trait_dict = _read("tft_trait_champion_dict.json")
+    _champion_trait_map = _read("tft_champion_trait_map.json")
 
 
-# ──────────────────────────────────────────────────────────────
-# 羁绊计算
-# ──────────────────────────────────────────────────────────────
-def calc_traits(champions: List[Dict], set_num: int = 16) -> List[Dict]:
-    """
-    根据英雄列表计算激活的羁绊。
-    需要 tft_champion_db.json 提供英雄 → 羁绊映射。
-    """
+def _text_quality_score(text: str) -> float:
+    text = text or ""
+    cjk = sum(2 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    latin = sum(0.2 for ch in text if ch.isascii() and ch.isalpha())
+    bad = (text.count("?") + text.count("�") + text.count("\ufffd")) * 3
+    return cjk + latin - bad + len(text) * 0.01
+
+
+def _fix_mojibake_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    candidates = [text]
+    for enc in ("gbk", "gb18030"):
+        try:
+            repaired = text.encode(enc, errors="ignore").decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if repaired:
+            candidates.append(repaired)
+    deduped: List[str] = []
+    for item in candidates:
+        if item and item not in deduped:
+            deduped.append(item)
+    return max(deduped, key=_text_quality_score)
+
+
+def _clean_match_text(text: str) -> str:
+    text = _fix_mojibake_text(text)
+    return re.sub(r'[?�\ufffd]+$', "", text).strip()
+
+
+def _normalize_lookup_text(text: str) -> str:
+    text = _clean_match_text(text).lower()
+    text = re.sub(r"[\s\-_'/·.]+", "", text)
+    text = re.sub(r"[()（）\[\]{}<>《》,:：，、;；|]+", "", text)
+    return text
+
+
+def _effective_set_number(default: int = 16) -> int:
+    meta_path = Path("tft_meta.json")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            set_number = int(meta.get("set_number", 0) or 0)
+            if set_number > 0:
+                return set_number
+        except Exception:
+            pass
+
     _load_db()
+    counts: Dict[int, int] = {}
+    for api_name in (_champion_db or {}).keys():
+        if not api_name.startswith("TFT") or "_" not in api_name:
+            continue
+        prefix = api_name.split("_", 1)[0]
+        try:
+            set_number = int(prefix[3:])
+        except ValueError:
+            continue
+        counts[set_number] = counts.get(set_number, 0) + 1
+    return max(counts.items(), key=lambda item: item[1])[0] if counts else default
 
-    # 统计每个羁绊的英雄数量
+
+def _current_set_only(api_name: str, set_num: int) -> bool:
+    if not api_name.startswith("TFT") or "_" not in api_name:
+        return True
+    prefix = api_name.split("_", 1)[0]
+    try:
+        return int(prefix[3:]) == set_num
+    except ValueError:
+        return True
+
+
+def _item_extra_aliases(api_name: str, short_id: str) -> List[str]:
+    key = short_id.lower()
+    aliases = {
+        "bluebuff": ["蓝buff", "蓝霸符"],
+        "jeweledgauntlet": ["法爆"],
+        "guinsoosrageblade": ["羊刀"],
+        "bramblevest": ["反甲"],
+        "warmogsarmor": ["狂徒"],
+        "dragonsclaw": ["龙牙"],
+        "hextechgunblade": ["科技枪"],
+        "infinityedge": ["无尽"],
+        "lastwhisper": ["轻语"],
+        "bloodthirster": ["饮血"],
+        "giantslayer": ["巨杀"],
+        "handofjustice": ["正义"],
+        "ionicspark": ["离子", "离子火花"],
+        "sunfirecape": ["日炎"],
+        "rabadonsdeathcap": ["帽子", "大帽"],
+        "redemption": ["救赎"],
+        "spearofshojin": ["青龙刀"],
+        "statikkshiv": ["电刀"],
+        "titansresolve": ["泰坦"],
+        "edgeofnight": ["夜刃"],
+        "archangelsstaff": ["大天使"],
+        "crownguard": ["冕卫"],
+        "evenshroud": ["薄暮"],
+        "protectorsvow": ["圣盾誓约", "圣盾使的誓约"],
+        "steraksgage": ["血手"],
+        "quicksilver": ["水银"],
+        "thiefsgloves": ["窃贼手套", "偷偷"],
+        "morellonomicon": ["鬼书"],
+    }
+    return aliases.get(key, aliases.get(api_name.lower(), []))
+
+
+def _build_champion_lookup_rows(set_num: int) -> List[Dict[str, Any]]:
+    _load_db()
+    rows: List[Dict[str, Any]] = []
+    for api_name, info in (_champion_db or {}).items():
+        if not _current_set_only(api_name, set_num):
+            continue
+        short_id = (info.get("short_id") or strip_prefix(api_name) or api_name).strip()
+        display_name = _clean_match_text(
+            info.get("name_cn") or info.get("name_zh") or info.get("name_en") or short_id
+        ) or short_id
+        aliases = {
+            api_name,
+            strip_prefix(api_name),
+            short_id,
+            info.get("short_id", ""),
+            info.get("name_en", ""),
+            info.get("name_cn", ""),
+            info.get("name_zh", ""),
+            display_name,
+        }
+        norm_aliases = sorted(
+            {_normalize_lookup_text(alias) for alias in aliases if _normalize_lookup_text(alias)},
+            key=len,
+            reverse=True,
+        )
+        try:
+            cost = int(info.get("cost", 0) or 0)
+        except Exception:
+            cost = 0
+        rows.append({
+            "id": api_name,
+            "short_id": short_id,
+            "display_name": display_name,
+            "cost": cost,
+            "aliases": norm_aliases,
+        })
+    return rows
+
+
+def _build_item_lookup_rows() -> List[Dict[str, Any]]:
+    _load_db()
+    rows: List[Dict[str, Any]] = []
+    for api_name, info in (_item_db or {}).items():
+        if not api_name.startswith("TFT_Item_"):
+            continue
+        short_id = strip_prefix(api_name)
+        display_name = _clean_match_text(
+            info.get("name_cn") or info.get("name_zh") or info.get("name_en") or short_id
+        ) or short_id
+        aliases = {
+            api_name,
+            short_id,
+            info.get("name_en", ""),
+            info.get("name_cn", ""),
+            info.get("name_zh", ""),
+            display_name,
+            *_item_extra_aliases(api_name, short_id),
+        }
+        norm_aliases = sorted(
+            {_normalize_lookup_text(alias) for alias in aliases if _normalize_lookup_text(alias)},
+            key=len,
+            reverse=True,
+        )
+        rows.append({
+            "id": api_name,
+            "short_id": short_id,
+            "display_name": display_name,
+            "aliases": norm_aliases,
+        })
+    return rows
+
+
+def _score_lookup_alias(query: str, alias: str) -> float:
+    if not query or not alias:
+        return 0.0
+    if query == alias:
+        return 1.0
+    if query in alias or alias in query:
+        return 0.92 + min(len(query), len(alias)) / max(len(query), len(alias), 1) * 0.06
+    return 0.0
+
+
+def _parse_star_value(text: str) -> Optional[int]:
+    token = _normalize_lookup_text(text)
+    if not token:
+        return None
+    patterns = (
+        (3, ("3星", "3x", "3*", "3star", "star3", "三星", "★★★", "⭐⭐⭐")),
+        (2, ("2星", "2x", "2*", "2star", "star2", "二星", "两星", "★★", "⭐⭐")),
+        (1, ("1星", "1x", "1*", "1star", "star1", "一星", "★", "⭐")),
+    )
+    for value, aliases in patterns:
+        if any(_normalize_lookup_text(alias) in token for alias in aliases):
+            return value
+    return None
+
+
+def _strip_star_text(text: str) -> str:
+    cleaned = text or ""
+    for pattern in (
+        r"[123]\s*(?:星|x|X|\*)",
+        r"(?:star|Star)\s*[123]",
+        r"[123]\s*(?:star|Star)",
+        r"[一二三两]\s*星",
+        r"[★☆⭐]+",
+    ):
+        cleaned = re.sub(pattern, " ", cleaned)
+    return cleaned
+
+
+def _best_fuzzy_row(token: str, rows: List[Dict[str, Any]], used_ids: Optional[set] = None) -> Optional[Dict[str, Any]]:
+    used_ids = used_ids or set()
+    query = _normalize_lookup_text(_strip_star_text(token))
+    if not query:
+        return None
+    best = None
+    best_score = 0.0
+    for row in rows:
+        if row["id"] in used_ids:
+            continue
+        score = max((_score_lookup_alias(query, alias) for alias in row["aliases"]), default=0.0)
+        if score > best_score:
+            best = row
+            best_score = score
+    threshold = 0.70 if re.search(r"[\u4e00-\u9fff]", token) else 0.80
+    return best if best is not None and best_score >= threshold else None
+
+
+def _find_alias_matches(text: str, rows: List[Dict[str, Any]], allow_duplicates: bool = False) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        for alias in row["aliases"]:
+            if not alias:
+                continue
+            start = text.find(alias)
+            while start != -1:
+                candidates.append({
+                    "row": row,
+                    "start": start,
+                    "end": start + len(alias),
+                    "length": len(alias),
+                })
+                start = text.find(alias, start + 1)
+    by_start: Dict[int, List[Dict[str, Any]]] = {}
+    for match in candidates:
+        by_start.setdefault(match["start"], []).append(match)
+
+    selected: List[Dict[str, Any]] = []
+    used_ids: set = set()
+    pos = 0
+    while pos < len(text):
+        options = [m for m in by_start.get(pos, []) if allow_duplicates or m["row"]["id"] not in used_ids]
+        if options:
+            best = max(options, key=lambda item: (item["length"], len(item["row"]["aliases"])))
+            selected.append(best)
+            used_ids.add(best["row"]["id"])
+            pos = best["end"]
+        else:
+            pos += 1
+    return selected
+
+
+def _extract_item_ids(block_text: str, item_rows: List[Dict[str, Any]], limit: int = 3) -> List[str]:
+    item_ids: List[str] = []
+    for match in _find_alias_matches(block_text, item_rows, allow_duplicates=False):
+        item_id = match["row"]["id"]
+        if item_id in item_ids:
+            continue
+        item_ids.append(item_id)
+        if len(item_ids) >= limit:
+            break
+    return item_ids
+
+
+def calc_traits(champions: List[Dict[str, Any]], set_num: int = 16) -> List[Dict[str, Any]]:
+    _load_db()
     trait_counts: Dict[str, int] = {}
     for champ in champions:
         champ_id = champ.get("id") or normalize_champ_id(champ.get("name_en", ""), set_num)
-        db_entry = _champion_db.get(champ_id, {})
-        traits   = db_entry.get("traits", [])
-        for t in traits:
-            trait_counts[t] = trait_counts.get(t, 0) + 1
+        db_entry = (_champion_db or {}).get(champ_id, {})
+        traits = db_entry.get("traits", [])
+        if not traits and isinstance(_champion_trait_map, dict):
+            traits = _champion_trait_map.get(champ_id, [])
+        for trait in traits:
+            trait_counts[trait] = trait_counts.get(trait, 0) + 1
 
-    if not trait_counts:
-        return []
-
-    # 查找激活等级
-    activated: List[Dict] = []
+    activated: List[Dict[str, Any]] = []
     for short_id, count in trait_counts.items():
-        # 在 trait_db 中查找（apiName 或 short_id）
         trait_entry = None
-        for key, val in (_trait_db or {}).items():
-            if val.get("short_id") == short_id or key == short_id:
-                trait_entry = val
+        for key, value in (_trait_db or {}).items():
+            if value.get("short_id") == short_id or key == short_id:
+                trait_entry = value
                 break
-        # 也在 trait_dict 中查找
         if not trait_entry and _trait_dict:
-            trait_entry_td = _trait_dict.get(short_id, {})
-            if trait_entry_td:
-                levels = trait_entry_td.get("activation", {}).get("levels", [])
-                name_en = trait_entry_td.get("name_en", short_id)
-                trait_entry = {"name_en": name_en, "levels": levels, "short_id": short_id}
-
+            td = _trait_dict.get(short_id, {})
+            if td:
+                trait_entry = {
+                    "id": short_id,
+                    "short_id": short_id,
+                    "name_en": td.get("name_en", short_id),
+                    "levels": td.get("activation", {}).get("levels", []),
+                }
         if not trait_entry:
             continue
 
-        levels = trait_entry.get("levels", [])
-        name_en = trait_entry.get("name_en", short_id)
-        api_id  = trait_entry.get("id", short_id)
-
-        # 确定激活等级
+        levels = sorted(int(v) for v in trait_entry.get("levels", []) if str(v).isdigit() or isinstance(v, int))
         active_level = 0
-        level_name   = ""
-        for lvl in sorted(levels):
+        for lvl in levels:
             if count >= lvl:
                 active_level = lvl
+        level_name = ""
         if active_level > 0:
-            level_idx = sorted(levels).index(active_level)
-            level_names = ["Bronze", "Silver", "Gold", "Prismatic"]
-            level_name  = level_names[min(level_idx, len(level_names)-1)]
-
+            names = ["Bronze", "Silver", "Gold", "Prismatic"]
+            level_name = names[min(levels.index(active_level), len(names) - 1)]
         activated.append({
-            "id"        : api_id,
-            "short_id"  : short_id,
-            "name_en"   : name_en,
-            "count"     : count,
-            "level"     : active_level,
+            "id": trait_entry.get("id", short_id),
+            "short_id": short_id,
+            "name_en": trait_entry.get("name_en", short_id),
+            "count": count,
+            "level": active_level,
             "level_name": level_name,
             "thresholds": levels,
         })
 
-    # 按激活等级 + 人数排序
-    activated.sort(key=lambda x: (-x["level"], -x["count"]))
+    activated.sort(key=lambda item: (-item["level"], -item["count"], item["name_en"]))
     return activated
 
 
-# ──────────────────────────────────────────────────────────────
-# 摘要生成
-# ──────────────────────────────────────────────────────────────
-from typing import Dict, List, Tuple
-from collections import Counter
-
-def build_summary(champions: List[Dict], traits: List[Dict]) -> Tuple[Dict, List[str]]:
-    """
-    生成阵容摘要和装备问题列表。
-    返回 (summary_dict, issues_list)
-    """
+def build_summary(champions: List[Dict[str, Any]], traits: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
     issues: List[str] = []
-    total  = len(champions)
-
-    # 🟢 核心修改：检查是否存在有效的位置信息
-    # lineup / global 模式下 position 为 None，此时直接默认站位合理
+    total = len(champions)
     has_position = any(c.get("position") for c in champions)
-    
     if has_position:
         front_rows = sum(1 for c in champions if c.get("position", {}).get("row", 0) >= 3)
         front_ratio = f"{front_rows}/{total}"
     else:
-        # 无位置信息时（如 lineup），默认站位无问题，避免误报或显示无意义的 0/N
         front_ratio = "默认合理 (无位置数据)"
 
-    # 主C：有装备的最高费英雄
     main_carry = ""
     max_cost = -1
-    for c in champions:
-        cost = c.get("cost", 0)
-        if c.get("items") and cost >= max_cost:
-            max_cost   = cost
-            main_carry = c.get("name_en") or c.get("id", "")
+    for champ in champions:
+        cost = int(champ.get("cost", 0) or 0)
+        if champ.get("items") and cost >= max_cost:
+            max_cost = cost
+            main_carry = champ.get("name_en") or champ.get("short_id") or champ.get("id", "")
 
-    # 装备问题检查
-    # 1. 高费英雄无装备
-    for c in champions:
-        if c.get("cost", 0) >= 4 and not c.get("items"):
-            name = c.get("name_en") or c.get("id", "?")
+    for champ in champions:
+        if int(champ.get("cost", 0) or 0) >= 4 and not champ.get("items"):
+            name = champ.get("name_en") or champ.get("id", "?")
             issues.append(f"{name}(费用≥4) 无装备")
 
-    # 2. 同一装备重复（除了部分可叠加的）
-    STACKABLE = {"TFT_Item_TitansResolve", "TFT_Item_BlueBuff", "TFT_Item_Morellonomicon"}
+    stackable = {"TFT_Item_TitansResolve", "TFT_Item_BlueBuff", "TFT_Item_Morellonomicon"}
     all_items: List[str] = []
-    for c in champions:
-        all_items.extend(c.get("items", []))
-        
-    item_counter = Counter(all_items)
-    for item, count in item_counter.items():
-        if count > 1 and item not in STACKABLE:
-            issues.append(f"{item} 重复装备 x{count}")
-
-    equipment_ok = len(issues) == 0
+    for champ in champions:
+        all_items.extend(champ.get("items", []))
+    for item_id, count in Counter(all_items).items():
+        if count > 1 and item_id not in stackable:
+            issues.append(f"{item_id} 重复装备 x{count}")
 
     summary = {
         "front_row_ratio": front_ratio,
-        "main_carry"     : main_carry,
-        "equipment_ok"   : equipment_ok,
-        "total_items"    : len(all_items),
-        "champion_count" : total,
+        "main_carry": main_carry,
+        "equipment_ok": len(issues) == 0,
+        "total_items": len(all_items),
+        "champion_count": total,
     }
     return summary, issues
 
 
-# ──────────────────────────────────────────────────────────────
-# 格式转换器
-# ──────────────────────────────────────────────────────────────
-def from_riot_json(data: Any, set_num: int = 16) -> Dict:
-    """
-    将 Riot 对局 API 返回的参与者 units 转换为标准格式。
-    data: list of units 或包含 "units"/"champions" key 的 dict
-    """
-    units = (data if isinstance(data, list)
-             else data.get("units", data.get("champions", [])))
-    champions: List[Dict] = []
-    for u in units:
-        raw_id = (u.get("character_id") or u.get("champion_id")
-                  or u.get("id") or u.get("name") or "")
+def from_riot_json(data: Any, set_num: int = 16) -> Dict[str, Any]:
+    units = data if isinstance(data, list) else data.get("units", data.get("champions", []))
+    champions: List[Dict[str, Any]] = []
+    for unit in units:
+        raw_id = unit.get("character_id") or unit.get("champion_id") or unit.get("id") or unit.get("name") or ""
         champ_id = normalize_champ_id(raw_id, set_num)
         short_id = strip_prefix(champ_id)
-
-        items = []
-        for i in u.get("itemNames", u.get("items", [])):
-            if i:
-                items.append(normalize_item_id(i))
-
+        items = [normalize_item_id(item) for item in unit.get("itemNames", unit.get("items", [])) if item]
         champions.append({
-            "id"      : champ_id,
+            "id": champ_id,
             "short_id": short_id,
-            "name_en" : short_id,
-            "star"    : int(u.get("tier", u.get("star", u.get("rarity", 1)))),
-            "cost"    : 0,
-            "items"   : items,
-            "position": u.get("position", {}),
+            "name_en": short_id,
+            "star": int(unit.get("tier", unit.get("star", unit.get("rarity", 1))) or 1),
+            "cost": 0,
+            "items": items,
+            "position": unit.get("position", {}),
         })
 
-    # 补全 cost
     _load_db()
-    for c in champions:
-        db_entry = (_champion_db or {}).get(c["id"], {})
-        c["cost"] = db_entry.get("cost", 0)
+    for champ in champions:
+        champ["cost"] = (_champion_db or {}).get(champ["id"], {}).get("cost", 0)
 
     traits = calc_traits(champions, set_num)
     summary, issues = build_summary(champions, traits)
-
     return {
-        "team_size"       : len(champions),
-        "champions"       : champions,
-        "traits"          : traits,
-        "summary"         : summary,
+        "team_size": len(champions),
+        "champions": champions,
+        "traits": traits,
+        "summary": summary,
         "equipment_issues": issues,
-        "_source"         : "riot_json",
+        "_source": "riot_json",
     }
 
 
-def from_text(text: str, set_num: int = 16) -> Dict:
-    """
-    简单文本解析：尝试从文本中提取英雄 ID 列表。
-    支持格式：
-      - 逗号/空格分隔的英雄名（英文）
-      - 每行一个英雄
-    """
+def from_text(text: str, set_num: int = 16) -> Dict[str, Any]:
     _load_db()
-    # 提取所有单词，与 champion_db 中的 short_id 比对
-    words = re.findall(r"[A-Za-z][A-Za-z']+", text)
-    champions: List[Dict] = []
-    found_ids: set = set()
+    if set_num == 16:
+        inferred_set = _effective_set_number(16)
+        if inferred_set != 16:
+            set_num = inferred_set
 
-    for word in words:
-        # 直接匹配或忽略大小写匹配
-        for full_id, entry in (_champion_db or {}).items():
-            sid = entry.get("short_id", "")
-            if sid.lower() == word.lower() and full_id not in found_ids:
-                champions.append({
-                    "id"      : full_id,
-                    "short_id": sid,
-                    "name_en" : sid,
-                    "star"    : 1,
-                    "cost"    : entry.get("cost", 0),
-                    "items"   : [],
+    champ_rows = _build_champion_lookup_rows(set_num)
+    item_rows = _build_item_lookup_rows()
+    raw_text = (text or "").strip()
+    normalized = _normalize_lookup_text(raw_text)
+    if not normalized:
+        return {"error": "未能从文本中识别出英雄，请输入英雄名、星级、装备或 JSON"}
+
+    champions: List[Dict[str, Any]] = []
+    champion_matches = _find_alias_matches(normalized, champ_rows, allow_duplicates=False)
+    if champion_matches:
+        for idx, match in enumerate(champion_matches):
+            block_end = champion_matches[idx + 1]["start"] if idx + 1 < len(champion_matches) else len(normalized)
+            block_text = normalized[match["start"]:block_end]
+            item_text = normalized[match["end"]:block_end]
+            row = match["row"]
+            champions.append({
+                "id": row["id"],
+                "short_id": row["short_id"],
+                "name_en": row["display_name"] or row["short_id"],
+                "star": _parse_star_value(block_text) or 1,
+                "cost": row["cost"],
+                "items": _extract_item_ids(item_text, item_rows, limit=3),
+                "position": {},
+            })
+    else:
+        tokens = [tok for tok in re.split(r"[\s,，、/|；;()（）\[\]{}<>《》\n\r\t]+", raw_text) if tok.strip()]
+        used_ids: set = set()
+        current: Optional[Dict[str, Any]] = None
+        for token in tokens:
+            champ_row = _best_fuzzy_row(token, champ_rows, used_ids)
+            if champ_row is not None:
+                if current is not None:
+                    champions.append(current)
+                    used_ids.add(current["id"])
+                current = {
+                    "id": champ_row["id"],
+                    "short_id": champ_row["short_id"],
+                    "name_en": champ_row["display_name"] or champ_row["short_id"],
+                    "star": _parse_star_value(token) or 1,
+                    "cost": champ_row["cost"],
+                    "items": [],
                     "position": {},
-                })
-                found_ids.add(full_id)
-                break
+                }
+                continue
+            if current is None:
+                continue
+            star = _parse_star_value(token)
+            if star is not None:
+                current["star"] = max(current["star"], star)
+                continue
+            item_row = _best_fuzzy_row(token, item_rows)
+            if item_row is not None and item_row["id"] not in current["items"] and len(current["items"]) < 3:
+                current["items"].append(item_row["id"])
+        if current is not None:
+            champions.append(current)
 
     if not champions:
-        return {"error": "未能从文本中识别出英雄，请使用英雄英文 ID 或上传 JSON"}
+        return {"error": "未能从文本中识别出英雄，请输入中文名、英文名、星级或装备名"}
 
     traits = calc_traits(champions, set_num)
     summary, issues = build_summary(champions, traits)
     return {
-        "team_size"       : len(champions),
-        "champions"       : champions,
-        "traits"          : traits,
-        "summary"         : summary,
+        "team_size": len(champions),
+        "champions": champions,
+        "traits": traits,
+        "summary": summary,
         "equipment_issues": issues,
-        "_source"         : "text",
+        "_source": "text",
     }
 
 
-def from_image(image_bytes: bytes, assets_dir: str = "./tft_assets") -> Dict:
-    """截图识别入口，委托给 tft_screen_capture"""
+def from_image(image_bytes: bytes, assets_dir: str = "./tft_assets") -> Dict[str, Any]:
     try:
-        from tft_screen_capture import recognize
-        result = recognize(image_bytes, assets_dir=assets_dir)
+        try:
+            from tft_screen_capture_yolo_clip import recognize  # type: ignore
+            result = recognize(image_bytes)
+        except ImportError:
+            from tft_screen_capture import recognize  # type: ignore
+            result = recognize(image_bytes, assets_dir=assets_dir)
         if not result.get("error"):
-            # 补全 cost
             _load_db()
-            for c in result.get("champions", []):
-                db_entry = (_champion_db or {}).get(c.get("id", ""), {})
-                c["cost"] = db_entry.get("cost", 0)
+            for champ in result.get("champions", []):
+                champ["cost"] = (_champion_db or {}).get(champ.get("id", ""), {}).get("cost", 0)
         return result
     except ImportError:
-        return {"error": "tft_screen_capture.py 未找到"}
-    except Exception as e:
-        return {"error": str(e)}
+        return {"error": "tft_screen_capture 模块未找到"}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
-# ──────────────────────────────────────────────────────────────
-# 统一入口
-# ──────────────────────────────────────────────────────────────
-def convert(source, assets_dir: str = "./tft_assets", set_num: int = 16) -> Dict:
-    """
-    自动检测输入类型并转换：
-      bytes/bytearray → 截图识别
-      dict/list       → Riot JSON
-      str             → JSON 字符串 或 自由文本
-    """
+def convert(source: Any, assets_dir: str = "./tft_assets", set_num: int = 16) -> Dict[str, Any]:
     if isinstance(source, (bytes, bytearray)):
         return from_image(source, assets_dir)
-
     if isinstance(source, (dict, list)):
         return from_riot_json(source, set_num)
-
     if isinstance(source, str):
-        s = source.strip()
-        if s.startswith(("[", "{")):
+        stripped = source.strip()
+        if stripped.startswith(("[", "{")):
             try:
-                return from_riot_json(json.loads(s), set_num)
+                return from_riot_json(json.loads(stripped), set_num)
             except json.JSONDecodeError:
                 pass
-        return from_text(s, set_num)
-
+        return from_text(stripped, set_num)
     return {"error": f"不支持的输入类型: {type(source)}"}
 
 
-def save_analysis(analysis: Dict, path: str = "tft_team_analysis.json") -> bool:
+def save_analysis(analysis: Dict[str, Any], path: str = "tft_team_analysis.json") -> bool:
     try:
-        Path(path).write_text(
-            json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        Path(path).write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
-    except Exception as e:
-        print(f"保存失败: {e}")
+    except Exception as exc:
+        print(f"保存失败: {exc}")
         return False
 
 
-# ──────────────────────────────────────────────────────────────
-# 兼容旧版调用（tft_screen_capture 中使用的函数名）
-# ──────────────────────────────────────────────────────────────
-def _calc_traits(champions: List[Dict]) -> List[Dict]:
+def _calc_traits(champions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return calc_traits(champions)
 
-def _build_summary(champions: List[Dict], traits: List[Dict]) -> Tuple[Dict, List[str]]:
+
+def _build_summary(champions: List[Dict[str, Any]], traits: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
     return build_summary(champions, traits)
 
 
-# ──────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("用法: python tft_converter.py <input.json|text|image.png>")
-        sys.exit(0)
+        raise SystemExit(0)
 
     src_arg = sys.argv[1]
     src_path = Path(src_arg)
     if src_path.exists():
         if src_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
-            data = src_path.read_bytes()
+            result = convert(src_path.read_bytes())
         else:
-            data = src_path.read_text(encoding="utf-8")
-            try:
-                data = json.loads(data)
-            except json.JSONDecodeError:
-                pass
+            result = convert(src_path.read_text(encoding="utf-8", errors="replace"))
     else:
-        data = src_arg
+        result = convert(src_arg)
 
-    result = convert(data)
     print(json.dumps(result, ensure_ascii=False, indent=2))

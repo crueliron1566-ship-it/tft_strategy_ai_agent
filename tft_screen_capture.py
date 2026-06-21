@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-tft_screen_capture.py
-TFT 截图识别引擎（模板匹配，基于 OpenCV）
-
-支持四种截图模式（自动检测）：
-  board   - Single-Board: 棋盘布局（4×7 六边形网格，DataTFT / 阵容模拟器）
-  lineup  - Single-Lineup: 结算简略图（英雄水平一排，无六边形边框）
-  global  - Global: 阵容羁绊表（8名玩家小图标，多行）
-  duel    - Duel: 战绩回顾（两个棋盘上下叠放）
-
-识别流程（board/duel 模式）：
-  1. 检测彩色六边形边框  → 定位每个英雄框
-  2. UI 图标过滤         → 排除羁绊徽章、棋盘装饰
-  3. 裁剪英雄内部区域   → 颜色直方图 + 零均值 NCC 匹配
-  4. 检测星级            → 统计星点数量
-  5. 识别装备            → 在英雄框下方区域做模板匹配
-
-用法:
-  python tft_screen_capture.py screenshot.png
-  python tft_screen_capture.py screenshot.png --mode lineup
-  python tft_screen_capture.py screenshot.png --mode global
-  python tft_screen_capture.py screenshot.png --debug
-  python tft_screen_capture.py screenshot.png --diagnose
-"""
 
 import cv2
 import numpy as np
